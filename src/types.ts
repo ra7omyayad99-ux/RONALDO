@@ -1,48 +1,52 @@
-export interface Player {
+export interface ComponentSpec {
   id: string;
-  name: string;
-  team: 'A' | 'B';
-  score: number;
+  nameAr: string;
+  nameEn: string;
+  category: 'controller' | 'sensor' | 'actuator' | 'power' | 'wiring_proto' | 'tool';
+  quantity: number;
+  specsAr: string[];
+  specsEn: string[];
+  originAr: string;
+  originEn: string;
+  principleAr: string;
+  principleEn: string;
+  imagePlaceholder: string;
 }
 
-export interface Question {
+export interface NodeData {
   id: string;
-  text: string;
-  options: string[];
-  correctIndex: number;
-  points: number;
+  nameAr: string;
+  nameEn: string;
+  descriptionAr: string;
+  descriptionEn: string;
+  roleAr: string;
+  roleEn: string;
+  gpioPins: {
+    pin: string;
+    targetAr: string;
+    targetEn: string;
+    protocol: string;
+  }[];
 }
 
-export interface Room {
+export interface QuizQuestion {
+  id: number;
+  questionAr: string;
+  questionEn: string;
+  optionsAr: string[];
+  optionsEn: string[];
+  correctAnswerIndex: number;
+  explanationAr: string;
+  explanationEn: string;
+}
+
+export interface WiringConnection {
   id: string;
-  createdAt: number;
-  status: 'lobby' | 'playing' | 'ended';
-  players: Player[];
-  questions: Question[];
-  currentQuestionIndex: number;
-  timerDuration: number;
-  timerEndTimestamp: number | null;
-  pausedRemaining: number | null;
-  timerActive: boolean;
-  timerRemaining: number; // calculated from server
-  scores: {
-    A: number;
-    B: number;
-  };
-  buzzedBy: {
-    playerId: string;
-    playerName: string;
-    team: 'A' | 'B';
-    timestamp: number;
-  } | null;
-  answersSubmitted: {
-    [playerId: string]: {
-      optionIndex: number;
-      isCorrect: boolean;
-      timestamp: number;
-    }
-  };
-  teamAName: string;
-  teamBName: string;
-  isLocalMode?: boolean;
+  from: string;
+  to: string;
+  color: string;
+  labelAr: string;
+  labelEn: string;
+  descAr: string;
+  descEn: string;
 }

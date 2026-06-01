@@ -1,8 +1,6 @@
 {
-  "name": "Remix: تحدي الفريقين - مسابقة أسئلة تفاعلية",
-  "description": "تطبيق مسابقات جماعي تفاعلي ومميز، يتيح تقسيم اللاعبين لقسمين والتنافس بالأسئلة مع مؤقت زمني، لوحة صدارة حية وتوليد ذكي للأسئلة بالذكاء الاصطناعي وبميزة الانضمام عبر رمز الاستجابة السريعة QR.",
+  "name": "Smart Irrigation Project Guide",
+  "description": "An interactive educational guide, assembly simulator, wiring planner and quiz for the Smart Salinity-Aware Irrigation graduation project.",
   "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -1,663 +1,227 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
-import fs from "fs";
 
+// Load environment variables
 dotenv.config();
 
-// Initialize the Gemini client if available
-let ai: GoogleGenAI | null = null;
-if (process.env.GEMINI_API_KEY) {
-  ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      }
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  // Middleware
+  app.use(express.json());
+
+  // Safe lazy initialization of Gemini API
+  const getGeminiClient = () => {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return null;
     }
-  });
-}
-
-const app = express();
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
-
-// Enable CORS manually to support cross-origin requests from external deployments like Vercel
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") {
-    res.sendStatus(200);
-    return;
-  }
-  next();
-});
-
-const ROOMS_FILE = path.join(process.cwd(), "rooms_backup.json");
-
-function saveRooms(data: any) {
-  try {
-    fs.writeFileSync(ROOMS_FILE, JSON.stringify(data, null, 2), "utf-8");
-  } catch (err) {
-    console.error("Failed to save rooms backup:", err);
-  }
-}
-
-const apiLogs: string[] = [];
-app.use("/api", (req, res, next) => {
-  const logStr = `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`;
-  apiLogs.push(logStr);
-  console.log(logStr);
-  
-  const originalJson = res.json;
-  res.json = function(body) {
-    const respLog = `[${new Date().toISOString()}] Status ${res.statusCode} for ${req.method} ${req.originalUrl}`;
-    apiLogs.push(respLog);
-    console.log(respLog);
-    
-    const result = originalJson.call(this, body);
-    if (req.method !== "GET" && req.originalUrl.includes("/api/rooms")) {
-      saveRooms(rooms);
-    }
-    return result;
-  };
-  next();
-});
-
-app.get("/api/debug-sync-logs", (req, res) => {
-  res.json({ logs: apiLogs.slice(-100) });
-});
-
-const PORT = 3000;
-
-interface Player {
-  id: string;
-  name: string;
-  team: 'A' | 'B';
-  score: number;
-}
-
-interface Question {
-  id: string;
-  text: string;
-  options: string[]; // usually 4 choices
-  correctIndex: number; // 0 to 3
-  points: number;
-}
-
-interface Room {
-  id: string; // 4-digit code e.g. '1234'
-  createdAt: number;
-  status: 'lobby' | 'playing' | 'ended';
-  players: Player[];
-  questions: Question[];
-  currentQuestionIndex: number;
-  
-  // High-performance Stateless Timer configuration
-  timerDuration: number; // default duration e.g. 20
-  timerEndTimestamp: number | null; // time when current count goes to 0
-  pausedRemaining: number | null; // remaining seconds if paused
-  timerActive: boolean;
-
-  scores: {
-    A: number;
-    B: number;
-  };
-  
-  // Game Actions
-  buzzedBy: {
-    playerId: string;
-    playerName: string;
-    team: 'A' | 'B';
-    timestamp: number;
-  } | null;
-
-  // Answers tracker
-  answersSubmitted: {
-    [playerId: string]: {
-      optionIndex: number;
-      isCorrect: boolean;
-      timestamp: number;
-    }
-  };
-
-  teamAName: string;
-  teamBName: string;
-}
-
-function loadRooms(): { [id: string]: Room } {
-  try {
-    if (fs.existsSync(ROOMS_FILE)) {
-      const data = fs.readFileSync(ROOMS_FILE, "utf-8");
-      return JSON.parse(data);
-    }
-  } catch (err) {
-    console.error("Failed to load rooms backup:", err);
-  }
-  return {};
-}
-
-// In-memory rooms cache preloaded from persistent backup file to persist hot-reloads and container cycles
-const rooms: { [id: string]: Room } = loadRooms();
-
-// Helper to calculate timer remaining without ticking loops
-function refreshRoomTimer(room: Room) {
-  if (!room.timerActive) {
-    return;
-  }
-  
-  if (room.timerEndTimestamp) {
-    const remaining = Math.max(0, Math.ceil((room.timerEndTimestamp - Date.now()) / 1000));
-    if (remaining === 0) {
-      room.timerActive = false;
-      room.timerEndTimestamp = null;
-      room.pausedRemaining = 0;
-    }
-  }
-}
-
-// Helper to get active timer state
-function getTimerRemaining(room: Room): number {
-  if (room.timerActive && room.timerEndTimestamp) {
-    return Math.max(0, Math.ceil((room.timerEndTimestamp - Date.now()) / 1000));
-  }
-  if (room.pausedRemaining !== null) {
-    return room.pausedRemaining;
-  }
-  return room.timerDuration;
-}
-
-// Default questions bank in Arabic
-const defaultQuestionsSeed: Question[] = [
-  {
-    id: "q1",
-    text: "ما هي عاصمة جمهورية مصر العربية؟",
-    options: ["الإسكندرية", "القاهرة", "الجيزة", "الأقصر"],
-    correctIndex: 1,
-    points: 10
-  },
-  {
-    id: "q2",
-    text: "أكبر محيط في العالم هو المحيط...",
-    options: ["الأطلسي", "الهندي", "الهادئ", "المتجمد الشمالي"],
-    correctIndex: 2,
-    points: 15
-  },
-  {
-    id: "q3",
-    text: "كم عدد كواكب المجموعة الشمسية؟",
-    options: ["7 كواكب", "8 كواكب", "9 كواكب", "10 كواكب"],
-    correctIndex: 1,
-    points: 10
-  },
-  {
-    id: "q4",
-    text: "مؤسس علم الجبر هو العالم العربي الشهير...",
-    options: ["ابن سينا", "الفارابي", "الخوارزمي", "ابن رشد"],
-    correctIndex: 2,
-    points: 20
-  },
-  {
-    id: "q5",
-    text: "ما هو أسرع حيوان بري على وجه الأرض؟",
-    options: ["الفهد", "الأسد", "الغزال", "الحصان البري"],
-    correctIndex: 0,
-    points: 10
-  }
-];
-
-// 1. Create a game room
-app.post("/api/rooms/create", (req, res) => {
-  const customQuestions = req.body.questions as Question[] | undefined;
-  
-  // Generate 4-digit unique code
-  let roomCode = "";
-  let attempts = 0;
-  do {
-    roomCode = Math.floor(1000 + Math.random() * 9000).toString();
-    attempts++;
-  } while (rooms[roomCode] && attempts < 50);
-
-  const newRoom: Room = {
-    id: roomCode,
-    createdAt: Date.now(),
-    status: 'lobby',
-    players: [],
-    questions: customQuestions && customQuestions.length > 0 ? customQuestions : [...defaultQuestionsSeed],
-    currentQuestionIndex: 0,
-    timerDuration: 20,
-    timerEndTimestamp: null,
-    pausedRemaining: null,
-    timerActive: false,
-    scores: {
-      A: 0,
-      B: 0
-    },
-    buzzedBy: null,
-    answersSubmitted: {},
-    teamAName: "الفريق الرمز (أ)",
-    teamBName: "الفريق المنافس (ب)"
-  };
-
-  rooms[roomCode] = newRoom;
-  res.json(newRoom);
-});
-
-// Sync and register room that was originally initialized locally
-app.post("/api/rooms/sync-local", (req, res) => {
-  const { room } = req.body;
-  if (!room || !room.id) {
-    return res.status(400).json({ error: "بيانات الغرفة غير صالحة" });
-  }
-
-  rooms[room.id] = {
-    ...room,
-    isLocalMode: false // Mark as online on the server
-  };
-
-  res.json(rooms[room.id]);
-});
-
-// 2. Fetch room status
-app.get("/api/rooms/:id", (req, res) => {
-  const room = rooms[req.params.id];
-  if (!room) {
-    return res.status(404).json({ error: "غرفة اللعب غير موجودة! يرجى التأكد من الرمز الإضافي." });
-  }
-  
-  refreshRoomTimer(room);
-  
-  // Return extra calculated properties
-  res.json({
-    ...room,
-    timerRemaining: getTimerRemaining(room)
-  });
-});
-
-// 3. Join a room as a player
-app.post("/api/rooms/:id/join", (req, res) => {
-  const { name, team } = req.body;
-  const room = rooms[req.params.id];
-  
-  if (!room) {
-    return res.status(404).json({ error: "غرفة اللعب غير موجودة!" });
-  }
-
-  if (!name || !team || (team !== 'A' && team !== 'B')) {
-    return res.status(400).json({ error: "البيانات المدخلة غير صحيحة. يرجى توفير الاسم واختيار الفريق." });
-  }
-
-  // Generate unique player ID
-  const playerId = "p_" + Math.random().toString(36).substr(2, 9);
-  const newPlayer: Player = {
-    id: playerId,
-    name: name.trim(),
-    team,
-    score: 0
-  };
-
-  room.players.push(newPlayer);
-  res.json({ playerId, player: newPlayer, room });
-});
-
-// 4. Update team names
-app.post("/api/rooms/:id/update-teams", (req, res) => {
-  const { teamAName, teamBName } = req.body;
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "الغرفة غير موجودة" });
-
-  if (teamAName) room.teamAName = teamAName;
-  if (teamBName) room.teamBName = teamBName;
-
-  res.json(room);
-});
-
-// 5. Update or set questions bank
-app.post("/api/rooms/:id/edit-questions", (req, res) => {
-  const { questions } = req.body;
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "الغرفة غير موجودة" });
-
-  if (Array.isArray(questions)) {
-    room.questions = questions.map((q: any, index) => ({
-      id: q.id || `q_${Date.now()}_${index}`,
-      text: q.text || "سؤال مجهول",
-      options: Array.isArray(q.options) ? q.options : ["أ", "ب", "ج", "د"],
-      correctIndex: typeof q.correctIndex === 'number' ? q.correctIndex : 0,
-      points: typeof q.points === 'number' ? q.points : 10
-    }));
-  }
-
-  res.json(room);
-});
-
-// 6. Start the game session
-app.post("/api/rooms/:id/start", (req, res) => {
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "الغرفة غير موجودة" });
-
-  room.status = 'playing';
-  room.currentQuestionIndex = 0;
-  room.scores = { A: 0, B: 0 };
-  room.buzzedBy = null;
-  room.answersSubmitted = {};
-  
-  // Set default question clock
-  room.timerActive = false;
-  room.pausedRemaining = room.timerDuration;
-  room.timerEndTimestamp = null;
-
-  res.json(room);
-});
-
-// 7. Question timer actions
-app.post("/api/rooms/:id/timer-action", (req, res) => {
-  const { action, duration } = req.body;
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "الغرفة غير موجودة" });
-
-  refreshRoomTimer(room);
-
-  if (duration && typeof duration === 'number') {
-    room.timerDuration = duration;
-  }
-
-  if (action === "start") {
-    room.timerActive = true;
-    const remaining = room.pausedRemaining !== null ? room.pausedRemaining : room.timerDuration;
-    room.timerEndTimestamp = Date.now() + remaining * 1000;
-    room.pausedRemaining = null;
-  } else if (action === "pause") {
-    if (room.timerActive && room.timerEndTimestamp) {
-      const remaining = Math.max(0, Math.ceil((room.timerEndTimestamp - Date.now()) / 1000));
-      room.pausedRemaining = remaining;
-    }
-    room.timerActive = false;
-    room.timerEndTimestamp = null;
-  } else if (action === "reset") {
-    room.timerActive = false;
-    room.timerEndTimestamp = null;
-    room.pausedRemaining = room.timerDuration;
-    room.buzzedBy = null;
-    room.answersSubmitted = {};
-  }
-
-  res.json({
-    ...room,
-    timerRemaining: getTimerRemaining(room)
-  });
-});
-
-// 8. Player buzzing
-app.post("/api/rooms/:id/buzz", (req, res) => {
-  const { playerId } = req.body;
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "غرفة اللعب غير صالحة" });
-
-  if (room.status !== 'playing') {
-    return res.status(400).json({ error: "المسابقة لم تبدأ بعد" });
-  }
-
-  // Already buzzed
-  if (room.buzzedBy) {
-    return res.json({ buzzed: false, message: "تم الضغط بالفعل مسبقاً من لاعب آخر!", currentBuzz: room.buzzedBy });
-  }
-
-  // Find player
-  const player = room.players.find(p => p.id === playerId);
-  if (!player) {
-    return res.status(404).json({ error: "لا يمكن العثور على اللاعب في هذا الفريق" });
-  }
-
-  // Auto-pause timer when buzzing
-  refreshRoomTimer(room);
-  if (room.timerActive && room.timerEndTimestamp) {
-    const remaining = Math.max(0, Math.ceil((room.timerEndTimestamp - Date.now()) / 1000));
-    room.pausedRemaining = remaining;
-  }
-  room.timerActive = false;
-  room.timerEndTimestamp = null;
-
-  // Set buzzer owner
-  room.buzzedBy = {
-    playerId: player.id,
-    playerName: player.name,
-    team: player.team,
-    timestamp: Date.now()
-  };
-
-  res.json({ buzzed: true, room: { ...room, timerRemaining: getTimerRemaining(room) } });
-});
-
-// 9. Host manual scoring or resolving buzzer
-app.post("/api/rooms/:id/score-manual", (req, res) => {
-  const { team, points, resolveBuzzer, isCorrect } = req.body;
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "غرفة اللعب غير موجودة" });
-
-  if (resolveBuzzer && room.buzzedBy) {
-    const scoredTeam = room.buzzedBy.team;
-    const currentQ = room.questions[room.currentQuestionIndex];
-    const qPoints = currentQ ? currentQ.points : 10;
-
-    if (isCorrect) {
-      room.scores[scoredTeam] += qPoints;
-      // Mark player score too if found
-      const player = room.players.find(p => p.id === room.buzzedBy?.playerId);
-      if (player) player.score += qPoints;
-    } else {
-      // Deduct half or full points, let's keep it safe (subtract nothing, or optional toggle)
-      // We will subtract 5 to provide thrill!
-      room.scores[scoredTeam] = Math.max(0, room.scores[scoredTeam] - Math.ceil(qPoints / 2));
-    }
-    room.buzzedBy = null; // Reset buzzer
-  } else if (team && typeof points === 'number') {
-    const targetTeam = team as 'A' | 'B';
-    room.scores[targetTeam] = Math.max(0, room.scores[targetTeam] + points);
-  }
-
-  res.json(room);
-});
-
-// 10. Submit Answer directly for quiz answer sheets
-app.post("/api/rooms/:id/submit-answer", (req, res) => {
-  const { playerId, optionIndex } = req.body;
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "غرفة اللعبة غير موجودة" });
-
-  const player = room.players.find(p => p.id === playerId);
-  if (!player) return res.status(404).json({ error: "اللاعب غير مسجل" });
-
-  const currentQ = room.questions[room.currentQuestionIndex];
-  if (!currentQ) return res.status(400).json({ error: "السؤال الحالي غير صالح" });
-
-  const isCorrect = optionIndex === currentQ.correctIndex;
-
-  // Record this player's submission
-  room.answersSubmitted[playerId] = {
-    optionIndex,
-    isCorrect,
-    timestamp: Date.now()
-  };
-
-  res.json({ success: true, isCorrect });
-});
-
-// 11. Host triggers automated calculation for the current question
-// For client devices that directly vote on correct answers
-app.post("/api/rooms/:id/reveal-answers", (req, res) => {
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "غرفة اللعبة غير موجودة" });
-
-  const currentQ = room.questions[room.currentQuestionIndex];
-  if (!currentQ) return res.status(400).json({ error: "لا يوجد سؤال نشط لتقييمه" });
-
-  // Calculate scores automatically for everyone who answered correctly!
-  // Points are given to the overall team score based on the count of correct players.
-  // We can add a proportional score, or flat points if at least one player got it correct.
-  // Let's add full question points to the team if at least one correct answer, or points proportional!
-  // Proportional looks extremely cool: points = correct_players_count * 5!
-  // Let's do: Every correct player earns flat question points for their team!
-  let teamACorrect = 0;
-  let teamBCorrect = 0;
-
-  room.players.forEach(p => {
-    const submission = room.answersSubmitted[p.id];
-    if (submission && submission.isCorrect) {
-      p.score += currentQ.points;
-      if (p.team === 'A') teamACorrect++;
-      else teamBCorrect++;
-    }
-  });
-
-  // Score multiplier for teams
-  if (teamACorrect > 0) room.scores.A += currentQ.points;
-  if (teamBCorrect > 0) room.scores.B += currentQ.points;
-
-  // Stop timer
-  room.timerActive = false;
-  room.timerEndTimestamp = null;
-  room.pausedRemaining = 0;
-
-  res.json({
-    room,
-    stats: {
-      teamACorrect,
-      teamBCorrect,
-      scoredPoints: currentQ.points
-    }
-  });
-});
-
-// 12. Host moves to Next Question
-app.post("/api/rooms/:id/next-question", (req, res) => {
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "غرفة اللعب غير صالحة" });
-
-  room.buzzedBy = null;
-  room.answersSubmitted = {};
-
-  if (room.currentQuestionIndex + 1 < room.questions.length) {
-    room.currentQuestionIndex += 1;
-    // Reset Timer values
-    room.timerActive = false;
-    room.pausedRemaining = room.timerDuration;
-    room.timerEndTimestamp = null;
-  } else {
-    room.status = 'ended';
-  }
-
-  res.json(room);
-});
-
-// 13. Kick player
-app.post("/api/rooms/:id/kick-player", (req, res) => {
-  const { playerId } = req.body;
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "الغرفة غير موجودة" });
-
-  room.players = room.players.filter(p => p.id !== playerId);
-  res.json(room);
-});
-
-// 14. Reset/Clear Room
-app.post("/api/rooms/:id/reset", (req, res) => {
-  const room = rooms[req.params.id];
-  if (!room) return res.status(404).json({ error: "الغرفة غير موجودة" });
-
-  room.status = 'lobby';
-  room.currentQuestionIndex = 0;
-  room.scores = { A: 0, B: 0 };
-  room.players.forEach(p => p.score = 0);
-  room.buzzedBy = null;
-  room.answersSubmitted = {};
-  room.timerActive = false;
-  room.pausedRemaining = room.timerDuration;
-  room.timerEndTimestamp = null;
-
-  res.json(room);
-});
-
-// 15. Generate questions dynamically using Gemini AI on any requested topic!
-app.post("/api/generate-questions-ai", async (req, res) => {
-  const { topic, amount } = req.body;
-  const count = Math.min(Math.max(Number(amount) || 5, 3), 15); // limit between 3 to 15 questions
-  const selectedTopic = topic || "الثقافة العامة والتاريخ";
-
-  if (!process.env.GEMINI_API_KEY || !ai) {
-    return res.status(422).json({ 
-      error: "مفتاح الذكاء الاصطناعي (GEMINI_API_KEY) لم يتم ضبطه في إعدادات التطبيق. يرجى توفير المفتاح في لوحة الأسرار (Secrets)." 
-    });
-  }
-
-  try {
-    const prompt = `أنت خبير مسابقات ثقافية وترفيهية ممتعة.
-قم بإنشاء عدد ${count} أسئلة اختيار من متعدد في موضوع: "${selectedTopic}".
-يجب أن تكون الأسئلة بالكامل باللغة العربية، شيقة، وممتعة للغاية.
-كل سؤال يجب أن يحتوي على أربعة خيارات واضحة، وخيار واحد صحيح فقط.
-يجب إرجاع النتيجة كـ JSON صارم مطابق لهيكل البيانات الموصوف أدناه بالكامل ولا تضف أي نص آخر قبله أو بعده.
-
-هيكل الـ JSON المطلوب:
-أعد مصفوفة من العناصر، كل عنصر يمثل سؤالاً ويحتوي على الحقول التالية:
-- text: نص السؤال في جملة كاملة واضحة ومثيرة.
-- options: مصفوفة تحتوي على 4 نصوص تمثل الاختيارات (أ، ب، ج، د).
-- correctIndex: رقم يمثل الفهرس الصحيح للجواب من (0 إلى 3).
-- points: قيمة النقاط المناسبة لصعوبة السؤال (مثلاً: 10 أو 15 أو 20 أو 25).`;
-
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              text: { type: Type.STRING, description: "نص السؤال بالكامل" },
-              options: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: "أربعة خيارات للسؤال"
-              },
-              correctIndex: { type: Type.INTEGER, description: "الرقم الصحيح للجواب من 0 إلى 3" },
-              points: { type: Type.INTEGER, description: "عدد النقاط للسؤال" }
-            },
-            required: ["text", "options", "correctIndex", "points"]
-          }
+    return new GoogleGenAI({
+      apiKey: apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
         }
       }
     });
+  };
 
-    const textOutput = response.text;
-    if (!textOutput) {
-      throw new Error("لم يقم الذكاء الاصطناعي بإنشاء رد صحيح");
+  // Student details dictionary for server fallback or reference
+  const studentsContext = `
+اسم المشروع: نظام الري الذكي المدرك للملوحة لمزارع نخيل البصرة
+المؤسسة: جامعة المعقل - كلية الهندسة - قسم هندسة التحكم والحاسبات (2024 - 2025)
+الأستاذ المشرف: د. أيمن م. إسماعيل
+
+الطلاب المشاركون وأدوارهم ومواضيعهم:
+1. عبدالرحمن اياد عثمان (عبدالرحمن اياد):
+   - المقدمة، العمود الفقري الزراعي، مشاكل الري بالغمر والملوحة وتأثيرها على نخيل البصرة، وهيكل العقد (Node Topology) في المزرعة.
+   - يدير الشرائح من 1 إلى 4.
+
+2. عباس هادي مطرود (عباس هادي):
+   - معمارية متحكم ESP32، مشكلة المعالج والـ ADC حريجة المزامنة (تصادم قراءة ADC1 مع Wi-Fi/ESP-NOW على ADC2)، ومجسات الرطوبة السعوية ومبدأ عملها الفيزيائي لعزل الصدأ.
+   - يدير الشرائح من 5 إلى 8.
+
+3. علاء مهدي حمدان (علاء مهدي):
+   - مجس المناخ الرقمي DHT22، مسبار الحرارة المقاوم للماء DS18B20 وناقل الـ 1-Wire، ومستشعر قطرات المطر العازل للغمر ومكافحة رطوبة الجو الزائفة.
+   - يدير الشرائح من 9 إلى 12.
+
+4. فهد طلال خليل (فهد طلال):
+   - بروتوكول توزيع شبكة الإرسال الموزعة ESP-NOW، مصفوفة التغذية وخفض الجهد LM2596، وتدابير الحماية والوقاية الكهربائية بالاعتماد على العازل البصري PC817، والدايود الحمائي 1N5408 الطائر لمنع التيارات العكسية للمضخات والصمامات.
+   - يدير الشرائح من 13 إلى 16.
+
+5. محمد علي جواد (محمد علي):
+   - معادلات معايرة التربة والملوحة الممتدة (Polynomials)، حسابات وتحليل استهلاك البطارية ودورة السبات العميق (Deep Sleep) لـ ESP32 لضمان تشغيل يدوم لـ 120 يوماً، وجدول تسعير المواد وحساب الجدوى الاقتصادية الكلية (BOM) البالغة 198,500 دينار عراقي فقط للنموذج.
+   - يدير الشرائح من 17 إلى 20.
+`;
+
+  // Local intelligent fallback response generator
+  const getLocalFallbackResponse = (studentId: any, question: string, language: string) => {
+    const lowercaseQ = question.toLowerCase();
+    let fallbackResponse = "";
+    const isAr = language === "ar";
+
+    if (isAr) {
+      fallbackResponse = `مرحباً بك! أنا المستشار العلمي المدمج لمشروع ري نخيل البصرة بجامعة المعقل. (مساعد محلي مدمج نشط)
+
+`;
+      
+      if (studentId == 1 || lowercaseQ.includes("عبدالرحمن") || lowercaseQ.includes("أياد") || lowercaseQ.includes("عثمان") || lowercaseQ.includes("الغمر") || lowercaseQ.includes("ري تقليدي") || lowercaseQ.includes("ملوح")) {
+        fallbackResponse += `• مراجعة موضوع الطالب م. عبدالرحمن اياد عثمان (سياق الري والملوحة وبنية الشبكة):
+- يقوم عبدالرحمن بشرح خطورة "الري بالغمر" (Traditional Flood Irrigation) في ريف البصرة؛ حيث تؤدي هذه الطريقة التقليدية إلى تبخر سريع للمياه المتراكمة مسببةً ترسب الملح السام حول جذور النخيل.
+- يركز عبدالرحمن على هيكلية العقد الموزعة (Cluster Network Topology) للسيطرة على المياه؛ حيث تقسم المزرعة لعقد ريفية ترتبط بطريقة Point-to-Point.
+- يعتمد نظام عبدالرحمن على قراءة مستشعرات الملوحة TDS لوقف الحقن التلقائي في حال ارتفاع ملوحة رافد شط العرب في فترة المد الأحمر لمنع تملح التربة وتلف الجزيئات العضوية وحماية قلب النخلة.`;
+      }
+      else if (studentId == 2 || lowercaseQ.includes("عباس") || lowercaseQ.includes("هادي") || lowercaseQ.includes("مطرود") || lowercaseQ.includes("esp32") || lowercaseQ.includes("معالج") || lowercaseQ.includes("سعوية") || lowercaseQ.includes("capacitive") || lowercaseQ.includes("adc")) {
+        fallbackResponse += `• مراجعة موضوع الطالب م. عباس هادي مطرود (معمارية المعالج ومستشعر الرطوبة السعوي):
+- يوضح عباس اختيار معالج ESP32 ذو النواة الثنائية (Tensilica Dual-Core) بتردد 240 ميجاهرتز لدعم الاتصال اللاسلكي الفوري والحسّ الحركي.
+- حل عباس المشكلة التاريخية للـ ADC الحريج في ESP32؛ حيث يتشارك الراديو اللاسلكي Wi-Fi/ESP-NOW مع قنوات ADC2، مما يعطل قراءة الحساسات المتصلة بها أثناء البث اللاسلكي. الحل البرمجي تم بالاعتماد الحصري على قنوات ADC1 وتفعيل قفل المزامنة (SemaPhore Locks) ومكافحة التداخل المغناطيسي.
+- يوظف المشروع مستشعرات الرطوبة السعوية (Capacitive Moisture Sensor v1.2) بدلاً من المقاومة؛ لأن المستشعرات السعوية لا تعرض النحاس للتعرية والتحلل الإلكتروني المباشر بالملوحة، مما يضمن كفاءة طويلة الأمد دون صدأ.`;
+      }
+      else if (studentId == 3 || lowercaseQ.includes("علاء") || lowercaseQ.includes("مهدي") || lowercaseQ.includes("حمدان") || lowercaseQ.includes("dht22") || lowercaseQ.includes("مسبار") || lowercaseQ.includes("ds18b20") || lowercaseQ.includes("حرارة") || lowercaseQ.includes("قطرات") || lowercaseQ.includes("مطر") || lowercaseQ.includes("مناخ") || lowercaseQ.includes("رطوبة")) {
+        fallbackResponse += `• مراجعة موضوع الطالب م. علاء مهدي حمدان (المناخ الرقمي ومسبار الحرارة الفولاذي):
+- مستشعر DHT22 (AM2302) الرقمي المميز: يقيس الحرارة من -40 إلى 80 مئوية (بدقة ±0.5م) والرطوبة النسبية من 0% إلى 100% (بدقة ±2%) على بروتوكول السلك الواحد الرقمي المحمي من التشويش المغناطيسي والجو الرطب العالي.
+- مسبار DS18B20 الفولاذي المقاوم للماء: يوضع على عمق 30 سم لقياس درجة حرارة باطن التربة والطبقة الجذور معتمداً على بروتوكول 1-Wire Bus؛ مما يتيح ربط عشرات الحساسات عبر سلك رقمي واحد بفضل العنوان الفيزيائي الفريد (64-bit ROM) لكل مسبار.
+- مجس الهطول المطري الذكي: يقوم بتأكيد وجود قطرات ماء فيزيائية لفصل الصمامات تلقائياً، مضافاً إليه حل دقيق لمنع قراءات الندى والضباب الزائف عن طريق تسخين ذاتي خفيف للمصفوفة النحاسية.`;
+      }
+      else if (studentId == 4 || lowercaseQ.includes("فهد") || lowercaseQ.includes("طلال") || lowercaseQ.includes("خليل") || lowercaseQ.includes("esp-now") || lowercaseQ.includes("حماية") || lowercaseQ.includes("عزل") || lowercaseQ.includes("بصري") || lowercaseQ.includes("optocoupler") || lowercaseQ.includes("pc817") || lowercaseQ.includes("lm2596") || lowercaseQ.includes("1n5408") || lowercaseQ.includes("دايود")) {
+        fallbackResponse += `• مراجعة موضوع الطالب م. فهد طلال خليل (بروتوكول ESP-NOW والوقاية الكهربائية):
+- بروتوكول ESP-NOW: شبكة لاسلكية من نوع P2P مخصصة للأجهزة الذكية منخفضة الطاقة، تمتاز بزمن ربط فائق السرعة (< 5 مللي ثانية) مقارنة بالـ Wi-Fi التقليدي، مما يحقق توفيراً مذهلاً في الطاقة للبطارية.
+- العوازل الضوئية PC817 (Optocoupler Isolation): توفر عزلاً كهربائياً كاملاً (حتى 5000 فولت RMS) بين المعالج الحساس ESP32 وجهد تشغيل الملفات الحثية الصاخبة للمضخات (12 فولت). يتم نقل الإشارة برمجياً عبر الأشعة تحت الحمراء داخلياً دون تلامس فيزيائي، مما يحمي ESP32 تماماً من الاحتراق وتأثير التيارات الارتدادية.
+- دايود الفرملة 1N5408 (Flyback Protection Diode): يربط على التوازي العكسي مع ملف الريليه لمنع التيارات العكسية عالية الجهد (Reverse EMF Spike) الناتجة من انهيار المجال المغناطيسي للملف لحظة الإغلاق، مما يحمي المنظومة كقفل أمامي قوي.
+- منظم LM2596 Buck Converter لخفض الجهد الكفؤ من 12 فولت إلى 5 فولت للمعقمات دون ضياع الطاقة بشكل حراري.`;
+      }
+      else if (studentId == 5 || lowercaseQ.includes("معايرة") || lowercaseQ.includes("polynomial") || lowercaseQ.includes("سبات") || lowercaseQ.includes("deep sleep") || lowercaseQ.includes("بطارية") || lowercaseQ.includes("استهلاك") || lowercaseQ.includes("bom") || lowercaseQ.includes("كلفة") || lowercaseQ.includes("تسعير")) {
+        fallbackResponse += `• مراجعة موضوع الطالب م. محمد علي جواد (المعايرة الرياضية وميزانية الطاقة والتسعير):
+- معادلات المعايرة غير الخطية (Polynomial Calibration): صاغ محمد معادلات من الدرجة الثالثة لربط فرق الجهد المقاس بالرطوبة الفعلية ونسب الملوحة بدقة عالية متجاوزاً الانحرافات الطبيعية لمستشعرات التربة السعوية.
+- حسابات ميزانية الطاقة والسبات العميق (Deep Sleep): يعتمد النظام على وضع النوم العميق لـ ESP32 حيث يتم تجميد كافة العمليات المعالجة وإيقاف الراديو، لينخفض استهلاك التيار إلى 15 ميكرو أمبير فقط. يستيقظ الجهاز لمدة 10 ثوانٍ كل ساعة لإجراء القراءات وإرسال البيانات لتشغيل يدوم لـ 120 يوماً متواصلاً بسعة بطارية 12V 7Ah.
+- الجدوى الاقتصادية وفاتورة المواد (BOM): بلغت تكلفة الإنتاج والقطع الفعلية للنموذج الأولي 198,500 دينار عراقي فقط، وهي كلفة معقولة للغاية.`;
+      }
+      else {
+        fallbackResponse += `يتضمن مشروعنا رصداً علمياً متكاملاً لري بساتين النخيل بالبصرة بشكل مدرك لملوحة شط العرب ومكافح للري بالغمر وتملح ريف الفاو وأبي الخصيب.
+تم تصميم كود العقد الموزعة بتقنيات ESP-NOW وعزل الأوبتوكبلر PC817 وحساب ميزانية استهلاك الطاقة الكلية بدقة متناهية تحت إشراف د. أيمن م. إسماعيل.
+يرجى توجيه تفاصيل سؤالك حول أحد المواضيع:
+- الري والملوحة (عبدالرحمن)
+- الـ ESP32 والـ ADC والـ Capacitive Sensors (عباس)
+- مجسات الحرارة والرطوبة والمطر DHT22, DS18B20 (علاء)
+- بروتوكول ESP-NOW ومنظمات الفولتية وحماية PC817 والدايود 1N5408 (فهد)
+- معادلات المعايرة والسبات العميق وفاتورة المواد الكلية البالغة 198,500 دينار عراقي (محمد)`;
+      }
+    } else {
+      fallbackResponse = `Welcome! I am the embedded Academic Advisor for the Al-Maaqal University Smart Palm Irrigation capstone project. (Internal Offline Mode)
+
+`;
+
+      if (studentId == 1 || lowercaseQ.includes("abdulrahman") || lowercaseQ.includes("flood") || lowercaseQ.includes("irrigation") || lowercaseQ.includes("salinity")) {
+        fallbackResponse += `• Review of student Eng. Abdulrahman Ayad Othman (Soil Salinity & Node Topology):
+- Abdulrahman addresses the dangers of "Traditional Flood Irrigation" in Basra palm fields. Flood irrigation causes rapid evaporation of standing water, concentrating toxic salt crusts around the date palm root zone.
+- He designed the distributed Node Network Topology (Cluster Layout) of the fields, connecting modules via p2p links.
+- Uses TDS sensors to dynamically stop irrigation during high salinity water influxes in Shatt Al-Arab, preserving palm cores from salt overload.`;
+      }
+      else if (studentId == 2 || lowercaseQ.includes("abbas") || lowercaseQ.includes("esp32") || lowercaseQ.includes("microcontroller") || lowercaseQ.includes("capacitive") || lowercaseQ.includes("adc")) {
+        fallbackResponse += `• Review of student Eng. Abbas Hadi Matroud (ESP32 CPU & Soil Probes):
+- Abbas justifies using the dual-core Tensilica ESP32 processor running at 240 MHz to handle rapid local logic and low latency wireless transmissions.
+- He solved the ADC conflict on ESP32, where Wi-Fi/ESP-NOW functions occupy ADC2 channels, locking any sensors connected to them. His code relies exclusively on ADC1 and implements semaphore locks for synchronization.
+- Utilizes Capacitive Soil Moisture Sensors (v1.2) over resistive ones because capacitive plates are insulated from direct electrolytic action with salt water, preventing copper oxidation.`;
+      }
+      else if (studentId == 3 || lowercaseQ.includes("alaa") || lowercaseQ.includes("dht22") || lowercaseQ.includes("ds18b20") || lowercaseQ.includes("temperature") || lowercaseQ.includes("rain") || lowercaseQ.includes("sensor")) {
+        fallbackResponse += `• Review of student Eng. Alaa Mahdi Hamdan (DHT22 Climate & DS18B20 Water Probes):
+- DHT22 (AM2302) Digital Sensor: Accurately monitors ambient temperature (-40 to 80°C, ±0.5°C) and relative humidity (0 to 100%, ±2%) using a digital single-bus protocol.
+- DS18B20 Waterproof Probe: Positioned 30cm deep in the soil to monitor root-zone soil temperature. Uses 1-Wire Bus allowing multiple sensors to be hooked to a single pin via their unique 64-bit ROM addresses.
+- Rain Drop Detector: Implements a smart condensing filter with on-board subtle copper heating to avoid fake high-moisture triggers caused by humid fog or morning dew.`;
+      }
+      else if (studentId == 4 || lowercaseQ.includes("fahad") || lowercaseQ.includes("esp-now") || lowercaseQ.includes("pc817") || lowercaseQ.includes("isolation") || lowercaseQ.includes("buck") || lowercaseQ.includes("diode")) {
+        fallbackResponse += `• Review of student Eng. Fahad Talal Khalil (ESP-NOW & Electrical Protection):
+- ESP-NOW Protocol: High speed connection (< 5ms setup compared to standard Wi-Fi router overheads) for low-latency, ultra low-power peer-to-peer data transfers.
+- PC817 Optocoupler Isolation: Completely isolates the low-voltage ESP32 logic circuitry from high inductions/spikes generated by the 12V water pumps and solenoid coils.
+- 1N5408 Flyback Protection Diode: Connected in reverse-parallel with inductive load magnetic relays to clamp voltage spikes (Reverse EMF) generated during switching events, saving the microprocessor.
+- LM2596 Buck Converter: Safely steps down the 12V battery power source to 5V with high efficiency compared to linear regulators.`;
+      }
+      else if (studentId == 5 || lowercaseQ.includes("calibration") || lowercaseQ.includes("polynomial") || lowercaseQ.includes("sleep") || lowercaseQ.includes("battery") || lowercaseQ.includes("bom")) {
+        fallbackResponse += `• Review of student Eng. Mohammed Ali Jawad (Calibration Curve, Power Budget & BOM cost):
+- Polynomial Calibration: Mohammed derived 3rd-order fitting equations to calibrate ADC readings into exact volumetric moisture content and TDS ppm values.
+- Sleep Budget Analysis: Utilizes ESP32 Deep Sleep shutting down the CPU core and radios down to 15 µA. The node wakes up for 10s per hour to report data drawing 180 mA, keeping a 12V 7Ah battery alive for 120+ days.
+- BOM & Feasibility: The total system prototype cost was documented at exactly 198,500 IQD, making it incredibly cost-effective.`;
+      }
+      else {
+        fallbackResponse += `This is the smart salinity-aware date-palm irrigation project of Al-Maaqal University under the supervision of Dr. Ayman M. Ismaiel.
+Please ask about any specific topic or student sub-system (Abdulrahman on Salinity, Abbas on ESP32/ADC, Alaa on Climate/DHT22, Fahad on PC817 Optocouplers/ESP-NOW, or Mohammed on Deep Sleep/BOM).`;
+      }
     }
 
-    const cleanedText = textOutput.trim();
-    const questionsData = JSON.parse(cleanedText);
-    
-    // Add unique IDs to the questions
-    const formattedQuestions = questionsData.map((q: any, i: number) => ({
-      id: `ai_${Date.now()}_${i}`,
-      text: q.text,
-      options: q.options,
-      correctIndex: q.correctIndex,
-      points: q.points || 10
-    }));
+    return fallbackResponse;
+  };
 
-    res.json({ questions: formattedQuestions });
-  } catch (error: any) {
-    console.error("Gemini Generation Error:", error);
-    res.status(500).json({ error: "فشل توليد الأسئلة الذكية: " + (error.message || error) });
-  }
-});
+  // API Endpoint for Student Q&A Search Tool
+  app.post("/api/student-query", async (req, res) => {
+    try {
+      const { studentId, question, language = "ar" } = req.body;
 
-// Configure Vite compiler middleware for development, serving index.html on secondary fallback
-async function serveApp() {
+      if (!question || typeof question !== "string") {
+        return res.status(400).json({ error: "Question is required." });
+      }
+
+      // Check if Gemini Client is available
+      const ai = getGeminiClient();
+
+      if (ai) {
+        try {
+          // If Gemini client is active, prepare beautiful systemic prompt
+          const systemInstruction = `You are "مساعد مشروع المعقل الذكي" (Al-Maaqal Smart Capstone AI Advisor), an elite academic engineer model.
+You have access to the complete graduation project report for the academic year 2024-2025.
+University: جامعة المعقل (Al-Maaqal University) - كلية الهندسة (College of Engineering) - قسم هندسة التحكم والحاسبات والأتمتة (Dept. of Control and Computer Engineering).
+Project Title: نظام الري الذكي المدرك للملوحة لمزارع نخيل البصرة (Smart Salinity-Aware Irrigation Controller for Basra Date Farms).
+Project Supervisor: الأستاذ المشرف الدكتور أيمن م. إسماعيل (Dr. Ayman M. Ismaiel).
+
+Here is the exact team member breakdown and their master subjects:
+${studentsContext}
+
+Answer the user's question with utmost scientific rigor and high-quality detail. Follow these absolute constraints:
+1. Ground your answers strictly on the actual project details above. If requested, cite the slides owned by the student.
+2. If asked in Arabic (العربية), answer in professional, eloquent, technical Arabic. If asked in English, answer in English.
+3. Be respectful and refer to students as distinguished engineering students of Al-Maaqal University.
+4. Keep the answer highly focused and educational. Keep it around 1-3 concise paragraphs, neatly formatted. Don't mention system variables or model configs.`;
+
+          const prompt = `Let's answer this question: "${question}".
+Target Student Context Selected: ${studentId === "all" ? "Whole Team" : `Student ID: ${studentId}`}`;
+
+          const response = await ai.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: prompt,
+            config: {
+              systemInstruction: systemInstruction,
+              temperature: 0.7,
+            },
+          });
+
+          return res.json({ response: response.text, isFallback: false });
+        } catch (genAiErr: any) {
+          console.warn("Gemini API call failed, automatically falling back to fully local high-fidelity advisor database:", genAiErr);
+          const fallbackResponse = getLocalFallbackResponse(studentId, question, language);
+          return res.json({ response: fallbackResponse, isFallback: true });
+        }
+      } else {
+        const fallbackResponse = getLocalFallbackResponse(studentId, question, language);
+        return res.json({ response: fallbackResponse, isFallback: true });
+      }
+    } catch (err: any) {
+      console.error("Global student-query route error:", err);
+      // Even if everything fails, we do not throw an HTTP 500. We fall back to standard local response!
+      try {
+        const { studentId, question, language = "ar" } = req.body || {};
+        const fallbackResponse = getLocalFallbackResponse(studentId || "all", question || "", language || "ar");
+        return res.json({ response: fallbackResponse, isFallback: true });
+      } catch (nestedErr) {
+        return res.status(500).json({ error: "Something went wrong processing your request." });
+      }
+    }
+  });
+
+
+  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -673,8 +237,8 @@ async function serveApp() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Express multi-user game server started on http://0.0.0.0:${PORT}`);
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
-serveApp();
+startServer();
